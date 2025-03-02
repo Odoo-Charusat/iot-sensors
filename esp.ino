@@ -5,6 +5,7 @@
 #include "secrets.h"
 #include <ArduinoJson.h>
 #include <math.h>
+#include <1euroFilter.h>
 
 #define RXp2 16
 #define TXp2 17
@@ -12,18 +13,39 @@
 // WiFi & AWS IoT Client
 #define AWS_IOT_PUBLISH_TOPIC "esp32/mpu6050"
 #define AWS_IOT_SUBSCRIBE_TOPIC "esp32/sub"
+
 #define WIFI_SSID "Threat"
 #define WIFI_PASSWORD "ambrosia123"
+
+#define SAMPLE_RATE 10  // 10Hz sampling rate
+#define HIGH_PASS_CUTOFF 0.2  // 0.2Hz high-pass filter
+#define LOW_PASS_CUTOFF 5.0  // 5Hz low-pass filter
+
+#define BUFFER_SIZE 10  // Buffer size for sliding window
+float buffer[BUFFER_SIZE];  
+int bufferIndex = 0; 
+
+// High-pass and Low-pass Filters
+OneEuroFilter highPassFilter(SAMPLE_RATE, HIGH_PASS_CUTOFF, 1.0, 0.0);
+OneEuroFilter lowPassFilter(SAMPLE_RATE, LOW_PASS_CUTOFF, 1.0, 0.0);
 
 WiFiClientSecure net;
 PubSubClient client(net);
 
-#define EARTHQUAKE_THRESHOLD 2  // Define an appropriate threshold for earthquake-like vibrations
-
 // Calculate Instrumental Intensity Function (IIF)
 float calculateIfF(float af) {
-    if (af > 0) {
+    if (af > 0) 
         return (2.0 * log10(af) + 0.94);
+    return 0;
+}
+
+// Calculate Richter scale magnitude correctly
+float calculateRichter(float amplitude) {
+    const float S = 0.001; // Standard earthquake amplitude in mm
+    const float B = 0.0;   // Distance correction factor (assumed 0 for now)
+    if (amplitude > 0) {
+        float M = log10(amplitude / S) + B;
+        return max(M, 0.0f); // Ensure no negative values
     }
     return 0;
 }
@@ -40,7 +62,7 @@ void connectToWiFi() {
         Serial.print(".");
         delay(1000);
 
-        if (millis() - startAttemptTime > 20000) { // Timeout after 20 sec
+        if (millis() - startAttemptTime > 20000) {
             Serial.println("\n[ERROR] WiFi Connection Timeout!");
             return;
         }
@@ -55,7 +77,6 @@ void connectToWiFi() {
 void messageHandler(char* topic, byte* payload, unsigned int length) {
     Serial.print("[AWS IoT] Message received on topic: ");
     Serial.println(topic);
-
     Serial.print("[AWS IoT] Payload: ");
     for (unsigned int i = 0; i < length; i++) {
         Serial.print((char)payload[i]);
@@ -80,7 +101,7 @@ void connectAWS() {
         Serial.print(".");
         delay(1000);
 
-        if (millis() - startAttemptTime > 20000) { // Timeout after 20 sec
+        if (millis() - startAttemptTime > 20000) {
             Serial.println("\n[ERROR] AWS IoT Connection Timeout!");
             return;
         }
@@ -88,8 +109,6 @@ void connectAWS() {
 
     Serial.println("\n[AWS IoT] Connected!");
     client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
-    Serial.print("[AWS IoT] Subscribed to: ");
-    Serial.println(AWS_IOT_SUBSCRIBE_TOPIC);
 }
 
 // Read MPU6050 Data from Arduino
@@ -97,8 +116,7 @@ String readMPU6050Data() {
     if (Serial2.available()) {
         String data = Serial2.readStringUntil('\n'); 
         data.trim();
-        Serial.print("[DEBUG] Received from Arduino: ");
-        Serial.println(data);
+        Serial.println("[MPU6050] Data Received: " + data);
         return data;
     }
     return "";
@@ -107,8 +125,8 @@ String readMPU6050Data() {
 // Send MPU6050 Data to AWS
 void sendMPUData(String data) {
     StaticJsonDocument<256> doc;
-
     DeserializationError error = deserializeJson(doc, data);
+
     if (error) {
         Serial.print("[ERROR] JSON Parsing Failed: ");
         Serial.println(error.c_str());
@@ -116,68 +134,54 @@ void sendMPUData(String data) {
     }
 
     if (doc.containsKey("acc_x") && doc.containsKey("acc_y") && doc.containsKey("acc_z")) {
-        // Calculate af as the magnitude of acceleration vector
-        float acc_x = doc["acc_x"];
-        float acc_y = doc["acc_y"];
-        float acc_z = doc["acc_z"];
+        float acc_x = doc["acc_x"].as<float>();
+        float acc_y = doc["acc_y"].as<float>();
+        float acc_z = doc["acc_z"].as<float>() - 9.8; // Remove gravity effect
         
-        float af = sqrt(acc_x * acc_x + acc_y * acc_y + acc_z * acc_z);
+        float af = sqrt(pow(acc_x, 2) + pow(acc_y, 2) + pow(acc_z, 2));
 
-        // Calculate IIF
+        // Apply high-pass and low-pass filtering
+        af = highPassFilter.filter(af);
+        af = lowPassFilter.filter(af);
+
         float iif = calculateIfF(af);
+        float richter = calculateRichter(af);
 
-        if (iif >= EARTHQUAKE_THRESHOLD) {  // Send data only if IIF exceeds the threshold
-            StaticJsonDocument<128> payloadDoc;
-            payloadDoc["af"] = af;
-            payloadDoc["iif"] = iif;  // Use IIF
-            payloadDoc["data_from"] = "esp32 Threat";
+        Serial.print("[MPU6050] Filtered Acceleration (af): ");
+        Serial.println(af);
+        Serial.print("[MPU6050] Instrumental Intensity Function (iif): ");
+        Serial.println(iif);
+        Serial.print("[MPU6050] Richter Magnitude: ");
+        Serial.println(richter);
+        Serial.println("[MPU6050] Location: my location");
 
-            String payload;
-            serializeJson(payloadDoc, payload);
+        // Publish JSON data to AWS IoT
+        StaticJsonDocument<128> payloadDoc;
+        payloadDoc["richter"] = richter;
+        payloadDoc["iif"] = iif;
+        payloadDoc["af"] = af;
+        payloadDoc["location"] = "my location";
 
-            Serial.print("[AWS IoT] Sending: ");
-            Serial.println(payload);
-
-            if (!client.publish(AWS_IOT_PUBLISH_TOPIC, payload.c_str())) {
-                Serial.println("[ERROR] MQTT Publish Failed!");
-            }
-        } else {
-            Serial.println("[INFO] Vibration below earthquake threshold, skipping transmission.");
-        }
-    } else {
-        Serial.println("[ERROR] Missing acceleration components in MPU6050 JSON data!");
+        String payload;
+        serializeJson(payloadDoc, payload);
+        client.publish(AWS_IOT_PUBLISH_TOPIC, payload.c_str());
     }
 }
 
-// Setup Function
+
+// Setup
 void setup() {
     Serial.begin(115200);
-    Serial2.begin(9600, SERIAL_8N1, RXp2, TXp2); // Use appropriate RX/TX pins
-
-    Serial.println("\n=== ESP32 AWS IoT MPU6050 Data Logger ===");
-    
+    Serial2.begin(9600, SERIAL_8N1, RXp2, TXp2);
     connectToWiFi();
     connectAWS();
 }
 
 // Main Loop
 void loop() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WiFi] Lost Connection! Reconnecting...");
-        connectToWiFi();
-    }
-
-    if (!client.connected()) {
-        Serial.println("[AWS IoT] MQTT Disconnected! Reconnecting...");
-        connectAWS();
-    }
-
-    client.loop();  // Keep MQTT running
-
+    if (!client.connected()) connectAWS();
+    client.loop();
     String data = readMPU6050Data();
-    if (data.length() > 0) {
-        sendMPUData(data);
-    }
-
-    delay(500);
+    if (!data.isEmpty()) sendMPUData(data);
+    delay(2000);
 }

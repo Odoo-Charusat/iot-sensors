@@ -10,4 +10,3 @@ The file esp.ino contains the arduino code in C++ for
 
 ### The ESP32 acts as an Edge Node - doing processing over itself.
 
-## Circuit Diagram
